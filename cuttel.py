@@ -3,12 +3,22 @@ import os
 import shlex
 import subprocess
 import threading
+import time
+import hashlib
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 # ----------------------------
-# Pixel-Clip Stapler v1.1
-# FFmpeg front-end with transitions + x264/x265 + NVENC (RTX-friendly)
+# CUTTEL v1.5
+# Adds:
+# - Default output path set to folder of first imported clips (when list is empty)
+# - Drag & drop "drop line indicator" (visual insertion line)
+# Keeps:
+# - Hover preview thumbnails (popup on dwell)
+# - Cancel button
+# - Scrollable log
+# - Progress bar via -progress pipe:1
+# - x264/x265 + NVENC
 # ----------------------------
 
 XFADE_TRANSITIONS = [
@@ -25,7 +35,6 @@ XFADE_TRANSITIONS = [
     ("Circle Close", "circleclose"),
 ]
 
-# UI preset list (maps to x264/x265 presets directly; for NVENC we map to slow/medium/fast-ish)
 PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"]
 
 CODECS = [
@@ -68,7 +77,6 @@ def ffprobe_info(path: str) -> dict:
 def ffprobe_duration_seconds(path: str) -> float:
     data = ffprobe_info(path)
 
-    # Prefer container duration
     fmt = data.get("format") or {}
     dur = None
     if "duration" in fmt and fmt["duration"] not in (None, ""):
@@ -77,7 +85,6 @@ def ffprobe_duration_seconds(path: str) -> float:
         except ValueError:
             dur = None
 
-    # Fallback: max stream duration
     if not dur:
         mx = 0.0
         for s in data.get("streams") or []:
@@ -103,10 +110,6 @@ def ffprobe_has_audio(path: str) -> bool:
 
 
 def map_ui_preset_to_nvenc(ui_preset: str) -> str:
-    """
-    NVENC presets are not the same as x264/x265. We'll map loosely.
-    This avoids using p1..p7 which varies by FFmpeg build/options.
-    """
     slow_group = {"slow", "slower", "veryslow"}
     medium_group = {"medium"}
     fast_group = {"ultrafast", "superfast", "veryfast", "faster", "fast"}
@@ -120,33 +123,20 @@ def map_ui_preset_to_nvenc(ui_preset: str) -> str:
 
 
 def build_video_encode_args(vcodec: str, quality: int, ui_preset: str):
-    """
-    quality:
-      - For x264/x265: CRF (lower = better, bigger)
-      - For NVENC: CQ (similar idea; lower = better, bigger)
-    """
     args = ["-c:v", vcodec]
 
     if vcodec in ("libx264", "libx265"):
         args += ["-preset", ui_preset, "-crf", str(quality)]
         if vcodec == "libx264":
             args += ["-profile:v", "high"]
-        else:
-            # x265 default is fine; we keep 8-bit yuv420p for broad compatibility
-            pass
 
     elif vcodec in ("h264_nvenc", "hevc_nvenc"):
         nvenc_preset = map_ui_preset_to_nvenc(ui_preset)
-        # NVENC rate control:
-        # -rc vbr for sane quality/size tradeoff, controlled via -cq
-        # (YouTube upload use-case: we mainly want fast + reasonable size)
         args += ["-preset", nvenc_preset, "-rc", "vbr", "-cq", str(quality), "-b:v", "0"]
         if vcodec == "h264_nvenc":
             args += ["-profile:v", "high"]
         else:
-            # hevc tag for better Apple playback compatibility; harmless elsewhere
             args += ["-tag:v", "hvc1"]
-
     else:
         raise ValueError(f"Unknown codec: {vcodec}")
 
@@ -154,12 +144,6 @@ def build_video_encode_args(vcodec: str, quality: int, ui_preset: str):
 
 
 def build_filter_graph(inputs, durations, has_audio, transition_name, tdur, fps=30, width=1920, height=1080):
-    """
-    Build filter_complex for:
-    - Normalize video: scale+pad to 1080p, fps, format, SAR
-    - Audio: if present, resample; if missing, generate silence of matching duration
-    - Chain xfade + acrossfade
-    """
     n = len(inputs)
     if n < 1:
         raise ValueError("No inputs")
@@ -171,14 +155,13 @@ def build_filter_graph(inputs, durations, has_audio, transition_name, tdur, fps=
             f"[{i}:v]"
             f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
-            f"fps={fps},format=yuv420p,setsar=1"
+            f"fps={fps},scale=in_range=pc:out_range=tv,format=yuv420p,setsar=1"
             f"[v{i}]"
         )
 
         if has_audio[i]:
             parts.append(f"[{i}:a]aresample=48000[a{i}]")
         else:
-            # Generate silence for the clip duration so acrossfade works
             d = durations[i]
             parts.append(f"anullsrc=r=48000:cl=stereo,atrim=0:{d},asetpts=N/SR/TB[a{i}]")
 
@@ -214,17 +197,58 @@ def build_filter_graph(inputs, durations, has_audio, transition_name, tdur, fps=
     return ";".join(parts), f"[{v_prev}]", f"[{a_prev}]"
 
 
+def fmt_time(sec: float) -> str:
+    if sec < 0:
+        sec = 0
+    m = int(sec // 60)
+    s = int(sec % 60)
+    h = int(m // 60)
+    m = m % 60
+    if h > 0:
+        return f"{h:d}:{m:02d}:{s:02d}"
+    return f"{m:d}:{s:02d}"
+
+
 class App(tk.Tk):
+
     def __init__(self):
         super().__init__()
-        self.title("Pixel Clip Stapler (FFmpeg) — v1.1")
+        self.title("CUTTEL (FFmpeg) — v1.5")
+        self.geometry("1060x720")
+        self.minsize(1060, 720)
 
-        self.geometry("900x600")
-        self.minsize(900, 600)
+        # runtime controls
+        self.proc = None
+        self.cancel_requested = threading.Event()
+        self.total_out_seconds = 0.0
 
-        self.files = []
+        # iid -> dict(path, dur, has_audio)
+        self.items = {}
+        self._iid_counter = 1
+
+        # thumbnail cache (hover preview only)
+        self.thumb_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cuttel_thumbs")
+        os.makedirs(self.thumb_dir, exist_ok=True)
+
+        # hover preview state
+        self._hover_after_id = None
+        self._hover_iid = None
+        self._preview_win = None
+        self._preview_label = None
+        self._preview_photo = None  # keep ref
+
+        # drag & drop state
+        self._drag_iid = None
+        self._drop_line_visible = False
+        self._drop_target = None  # (iid, insert_after_bool)
+
         self._build_ui()
+        
+    def clear_log(self):
+        self.log.delete("1.0", "end")
 
+
+    # ---------------- UI ----------------
     def _build_ui(self):
         root = ttk.Frame(self, padding=10)
         root.pack(fill="both", expand=True)
@@ -232,8 +256,40 @@ class App(tk.Tk):
         top = ttk.Frame(root)
         top.pack(fill="both", expand=True)
 
-        self.listbox = tk.Listbox(top, selectmode=tk.EXTENDED)
-        self.listbox.pack(side="left", fill="both", expand=True)
+        self.tree_frame = ttk.Frame(top)
+        self.tree_frame.pack(side="left", fill="both", expand=True)
+
+        self.tree = ttk.Treeview(
+            self.tree_frame,
+            columns=("duration", "audio"),
+            show="tree headings",
+            selectmode="extended",
+            height=12
+        )
+        self.tree.heading("#0", text="Clip")
+        self.tree.heading("duration", text="Duration")
+        self.tree.heading("audio", text="Audio")
+        self.tree.column("#0", width=760, anchor="w")
+        self.tree.column("duration", width=110, anchor="center")
+        self.tree.column("audio", width=70, anchor="center")
+        self.tree.pack(side="left", fill="both", expand=True)
+
+        self.tree_scroll = ttk.Scrollbar(self.tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree_scroll.pack(side="right", fill="y")
+        self.tree.configure(yscrollcommand=self.tree_scroll.set)
+
+        # Drop line indicator (a thin tk.Frame placed over the Treeview)
+        self.drop_line = tk.Frame(self.tree, height=3, bg="#0b6b3a")
+        self.drop_line.place_forget()
+
+        # Hover preview bindings
+        self.tree.bind("<Motion>", self._on_tree_motion)
+        self.tree.bind("<Leave>", self._on_tree_leave)
+
+        # Drag & drop bindings
+        self.tree.bind("<ButtonPress-1>", self._on_tree_press, add=True)
+        self.tree.bind("<B1-Motion>", self._on_tree_drag)
+        self.tree.bind("<ButtonRelease-1>", self._on_tree_release)
 
         btns = ttk.Frame(top)
         btns.pack(side="left", fill="y", padx=(10, 0))
@@ -245,6 +301,7 @@ class App(tk.Tk):
         ttk.Separator(btns).pack(fill="x", pady=10)
         ttk.Button(btns, text="Clear", command=self.clear_all).pack(fill="x")
 
+        # ---- settings
         mid = ttk.LabelFrame(root, text="Export settings", padding=10)
         mid.pack(fill="x", pady=(10, 0))
 
@@ -253,9 +310,7 @@ class App(tk.Tk):
         ttk.Label(mid, text="Transition:").grid(row=row, column=0, sticky="w")
         self.transition_var = tk.StringVar(value=XFADE_TRANSITIONS[0][1])
         self.transition_menu = ttk.Combobox(
-            mid,
-            values=[f"{name}  ({code})" for name, code in XFADE_TRANSITIONS],
-            state="readonly"
+            mid, values=[f"{name}  ({code})" for name, code in XFADE_TRANSITIONS], state="readonly"
         )
         self.transition_menu.current(0)
         self.transition_menu.grid(row=row, column=1, sticky="we", padx=8)
@@ -273,34 +328,24 @@ class App(tk.Tk):
         row += 1
 
         ttk.Label(mid, text="Codec:").grid(row=row, column=0, sticky="w")
-        self.codec_var = tk.StringVar(value=CODECS[0][1])
-        self.codec_menu = ttk.Combobox(
-            mid,
-            values=[name for name, _ in CODECS],
-            state="readonly",
-            width=22
-        )
-        self.codec_menu.current(0)
+        self.codec_menu = ttk.Combobox(mid, values=[name for name, _ in CODECS], state="readonly", width=28)
+        self.codec_menu.current(3)  # default: H.265 NVENC/HEVC
         self.codec_menu.grid(row=row, column=1, sticky="w", padx=8)
+
+        ttk.Label(mid, text="Quality (CRF/CQ):").grid(row=row, column=2, sticky="w")
+        self.quality_var = tk.IntVar(value=28)  # sane HEVC-ish default
+        ttk.Spinbox(mid, from_=16, to=35, textvariable=self.quality_var, width=6).grid(row=row, column=3, sticky="w")
 
         def on_codec_pick(_evt=None):
             idx = self.codec_menu.current()
-            self.codec_var.set(CODECS[idx][1])
-            # Nudge defaults if user switches families
-            vcodec = self.codec_var.get()
+            vcodec = CODECS[idx][1]
             q = self.quality_var.get()
-            # If you select x265 or hevc_nvenc and quality is x264-ish default, bump to a more typical HEVC-ish default.
             if vcodec in ("libx265", "hevc_nvenc") and q == 23:
                 self.quality_var.set(28)
-            # If you select x264/h264_nvenc and quality is hevc-ish default, pull back.
             if vcodec in ("libx264", "h264_nvenc") and q == 28:
                 self.quality_var.set(23)
 
         self.codec_menu.bind("<<ComboboxSelected>>", on_codec_pick)
-
-        ttk.Label(mid, text="Quality (CRF/CQ):").grid(row=row, column=2, sticky="w")
-        self.quality_var = tk.IntVar(value=23)  # x264-ish default
-        ttk.Spinbox(mid, from_=16, to=35, textvariable=self.quality_var, width=6).grid(row=row, column=3, sticky="w")
 
         row += 1
 
@@ -322,45 +367,346 @@ class App(tk.Tk):
             row=row, column=1, sticky="w", padx=8
         )
 
-        ttk.Label(mid, text="Note: NVENC = fast; x264/x265 = slower but best compression.").grid(
+        ttk.Label(mid, text="Hover preview + drag & drop reorder (with insertion line).").grid(
             row=row, column=2, columnspan=2, sticky="w"
         )
 
         mid.grid_columnconfigure(1, weight=1)
 
+        # ---- output
         out = ttk.LabelFrame(root, text="Output", padding=10)
         out.pack(fill="x", pady=(10, 0))
 
         self.out_var = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "Desktop", "stitched_1080p.mp4"))
-        ttk.Entry(out, textvariable=self.out_var).pack(side="left", fill="x", expand=True)
+        self.out_entry = ttk.Entry(out, textvariable=self.out_var)
+        self.out_entry.pack(side="left", fill="x", expand=True)
         ttk.Button(out, text="Browse…", command=self.pick_output).pack(side="left", padx=(8, 0))
 
-        bottom = ttk.Frame(root)
-        bottom.pack(fill="x", pady=(10, 0))
+        # ---- controls + progress
+        ctrl = ttk.Frame(root)
+        ctrl.pack(fill="x", pady=(10, 0))
 
-        self.start_btn = ttk.Button(bottom, text="Stitch + Export", command=self.start)
+        self.start_btn = ttk.Button(ctrl, text="Stitch + Export", command=self.start)
         self.start_btn.pack(side="left")
 
-        self.progress = ttk.Label(bottom, text="Idle.")
-        self.progress.pack(side="left", padx=12)
+        self.cancel_btn = ttk.Button(ctrl, text="Cancel", command=self.cancel, state="disabled")
+        self.cancel_btn.pack(side="left", padx=(8, 0))
 
-        self.log = tk.Text(root, height=12)
-        self.log.pack(fill="both", expand=False, pady=(10, 0))
-        self.log.configure(state="disabled")
+        self.clear_log_btn = ttk.Button(ctrl, text="Clear log", command=self.clear_log)
+        self.clear_log_btn.pack(side="left", padx=(8, 0))
+
+        self.progress = ttk.Progressbar(ctrl, orient="horizontal", mode="determinate", length=500)
+        self.progress.pack(side="left", padx=12, fill="x", expand=True)
+
+        self.progress_label = ttk.Label(ctrl, text="Idle.")
+        self.progress_label.pack(side="left", padx=(10, 0))
+
+        # ---- scrollable log
+        log_frame = ttk.LabelFrame(root, text="Log", padding=6)
+        log_frame.pack(fill="both", expand=False, pady=(10, 0))
+
+        self.log = tk.Text(log_frame, height=14, wrap="none")
+        self.log.pack(side="left", fill="both", expand=True)
+
+        self.log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
+        self.log_scroll.pack(side="right", fill="y")
+        self.log.configure(yscrollcommand=self.log_scroll.set)
+
+        self.log.bind("<MouseWheel>", self._on_mousewheel)
+        self.log.bind("<Button-4>", lambda e: self.log.yview_scroll(-1, "units"))
+        self.log.bind("<Button-5>", lambda e: self.log.yview_scroll(+1, "units"))
 
         try:
             ttk.Style().theme_use("clam")
         except tk.TclError:
             pass
 
+    # ---------------- general helpers ----------------
+    def _on_mousewheel(self, event):
+        lines = int(-1 * (event.delta / 120))
+        self.log.yview_scroll(lines, "units")
+
+    def ui(self, fn, *args):
+        self.after(0, lambda: fn(*args))
+
     def log_line(self, s: str):
-        self.log.configure(state="normal")
         self.log.insert("end", s.rstrip() + "\n")
         self.log.see("end")
-        self.log.configure(state="disabled")
 
-    def set_status(self, s: str):
-        self.progress.config(text=s)
+    def set_progress(self, cur_sec: float, total_sec: float, speed: str = ""):
+        if total_sec <= 0:
+            self.progress["value"] = 0
+            self.progress_label.config(text="Working…")
+            return
+        pct = max(0.0, min(100.0, (cur_sec / total_sec) * 100.0))
+        self.progress["value"] = pct
+        ttxt = f"{fmt_time(cur_sec)} / {fmt_time(total_sec)}"
+        if speed:
+            ttxt += f"  ({speed})"
+        self.progress_label.config(text=ttxt)
+
+    def set_status_text(self, s: str):
+        self.progress_label.config(text=s)
+
+    def set_busy_state(self, busy: bool):
+        self.start_btn.config(state="disabled" if busy else "normal")
+        self.cancel_btn.config(state="normal" if busy else "disabled")
+
+    # ---------------- thumb cache (hover preview) ----------------
+    def _thumb_key(self, path: str) -> str:
+        st = os.stat(path)
+        raw = f"{path}|{st.st_size}|{st.st_mtime_ns}".encode("utf-8", errors="ignore")
+        return hashlib.md5(raw).hexdigest()
+
+    def _thumb_path(self, path: str) -> str:
+        return os.path.join(self.thumb_dir, self._thumb_key(path) + ".png")
+
+    def _ensure_thumb(self, path: str) -> str | None:
+        out_png = self._thumb_path(path)
+        if os.path.exists(out_png):
+            return out_png
+
+        cmd = [
+            FFMPEG, "-y",
+            "-ss", "0.2",
+            "-i", path,
+            "-frames:v", "1",
+            "-vf", "scale=320:-1",
+            "-f", "image2",
+            out_png
+        ]
+        code, out, err = run_cmd_capture(cmd)
+        if code != 0 or not os.path.exists(out_png):
+            return None
+        return out_png
+
+    # ---------------- hover preview popup ----------------
+    def _preview_hide(self):
+        if self._hover_after_id:
+            try:
+                self.after_cancel(self._hover_after_id)
+            except Exception:
+                pass
+            self._hover_after_id = None
+        self._hover_iid = None
+        if self._preview_win:
+            try:
+                self._preview_win.destroy()
+            except Exception:
+                pass
+        self._preview_win = None
+        self._preview_label = None
+        self._preview_photo = None
+
+    def _preview_show_loading(self, iid: str, x_root: int, y_root: int):
+        self._preview_hide()
+        self._hover_iid = iid
+
+        win = tk.Toplevel(self)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.geometry(f"+{x_root}+{y_root}")
+        frm = ttk.Frame(win, padding=6)
+        frm.pack(fill="both", expand=True)
+
+        lbl = ttk.Label(frm, text="Loading preview…")
+        lbl.pack()
+
+        self._preview_win = win
+        self._preview_label = lbl
+
+    def _preview_update_image(self, iid: str, photo: tk.PhotoImage):
+        if self._hover_iid != iid or not self._preview_win or not self._preview_label:
+            return
+        self._preview_photo = photo
+        self._preview_label.configure(image=photo, text="")
+        self._preview_label.image = photo
+
+    def _preview_load_async(self, iid: str, path: str):
+        def worker():
+            thumb_file = self._ensure_thumb(path)
+            if not thumb_file:
+                return
+            try:
+                photo = tk.PhotoImage(file=thumb_file)
+            except Exception:
+                return
+            self.ui(self._preview_update_image, iid, photo)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_tree_motion(self, event):
+        if self._drag_iid is not None:
+            self._preview_hide()
+            return
+
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            self._preview_hide()
+            return
+
+        if iid == self._hover_iid:
+            return
+
+        self._preview_hide()
+
+        # Place preview near cursor (20px offset), clamp to screen edges
+        x_root = self.winfo_pointerx() + 20
+        y_root = self.winfo_pointery() + 20
+
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        # Approx preview size (safe-ish); tweak if you want bigger
+        pw, ph = 360, 240
+        if x_root + pw > sw:
+            x_root = sw - pw - 10
+        if y_root + ph > sh:
+            y_root = sh - ph - 10
+        if x_root < 10:
+            x_root = 10
+        if y_root < 10:
+            y_root = 10
+
+        self._hover_iid = iid
+
+        def show():
+            if self._hover_iid != iid:
+                return
+            item = self.items.get(iid)
+            if not item:
+                return
+            self._preview_show_loading(iid, x_root, y_root)
+            self._preview_load_async(iid, item["path"])
+
+        self._hover_after_id = self.after(400, show)
+
+    def _on_tree_leave(self, event):
+        self._preview_hide()
+        self._drop_line_hide()
+
+    # ---------------- drop line indicator ----------------
+    def _drop_line_show(self, y: int):
+        # Place inside the Treeview widget (not frame), so it scrolls naturally
+        w = max(10, self.tree.winfo_width())
+        self.drop_line.place(in_=self.tree, x=0, y=y, width=w, height=2)
+        self._drop_line_visible = True
+
+    def _drop_line_hide(self):
+        if self._drop_line_visible:
+            self.drop_line.place_forget()
+            self._drop_line_visible = False
+        self._drop_target = None
+
+    def _compute_drop_target(self, event_y: int):
+        iid = self.tree.identify_row(event_y)
+        if not iid:
+            return None
+
+        bbox = self.tree.bbox(iid)
+        if not bbox:
+            return None
+
+        x, y, w, h = bbox
+        insert_after = event_y > (y + h / 2)
+        line_y = y + (h if insert_after else 0)
+        return (iid, insert_after, line_y)
+
+    # ---------------- drag & drop reorder ----------------
+    def _on_tree_press(self, event):
+        region = self.tree.identify_region(event.x, event.y)
+        if region == "heading":
+            return
+
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            self._drag_iid = None
+            self._drop_line_hide()
+            return
+
+        self._drag_iid = iid
+        self._preview_hide()
+
+    def _contiguous_in_current_order(self, iids: list[str]) -> bool:
+        children = list(self.tree.get_children(""))
+        idxs = [children.index(i) for i in iids if i in children]
+        if not idxs:
+            return False
+        idxs_sorted = sorted(idxs)
+        return idxs_sorted == list(range(idxs_sorted[0], idxs_sorted[0] + len(idxs_sorted)))
+
+    def _on_tree_drag(self, event):
+        if not self._drag_iid:
+            return
+
+        self._preview_hide()
+
+        tgt = self._compute_drop_target(event.y)
+        if not tgt:
+            self._drop_line_hide()
+            return
+
+        iid, insert_after, line_y = tgt
+        self._drop_target = (iid, insert_after)
+        self._drop_line_show(int(line_y))
+
+    def _on_tree_release(self, event):
+        if not self._drag_iid:
+            self._drop_line_hide()
+            return
+
+        self._drop_line_hide()
+
+        drop_iid = self.tree.identify_row(event.y)
+        if not drop_iid:
+            self._drag_iid = None
+            return
+
+        children = list(self.tree.get_children(""))
+
+        sel = list(self.tree.selection())
+        if self._drag_iid in sel and len(sel) > 1 and self._contiguous_in_current_order(sel):
+            block = [c for c in children if c in sel]
+        else:
+            block = [self._drag_iid]
+
+        if drop_iid in block:
+            self._drag_iid = None
+            return
+
+        bbox = self.tree.bbox(drop_iid)
+        insert_after = False
+        if bbox:
+            x, y, w, h = bbox
+            if event.y > y + (h / 2):
+                insert_after = True
+
+        base = [c for c in children if c not in block]
+
+        try:
+            drop_index = base.index(drop_iid)
+        except ValueError:
+            drop_index = len(base)
+
+        if insert_after:
+            drop_index += 1
+
+        new_order = base[:drop_index] + block + base[drop_index:]
+
+        for idx, iid in enumerate(new_order):
+            self.tree.move(iid, "", idx)
+
+        self.tree.selection_set(block)
+        self.tree.focus(block[0])
+
+        self._drag_iid = None
+
+    # ---------------- list operations ----------------
+    def _existing_paths_set(self):
+        return {item["path"] for item in self.items.values()}
+
+    def _set_default_output_folder_from_path(self, first_path: str):
+        folder = os.path.dirname(first_path)
+        out_path = os.path.join(folder, "stitched_1080p.mp4")
+        self.out_var.set(out_path)
 
     def add_files(self):
         paths = filedialog.askopenfilenames(
@@ -372,51 +718,110 @@ class App(tk.Tk):
         )
         if not paths:
             return
+
+        was_empty = (len(self.items) == 0)
+
+        existing = self._existing_paths_set()
+        new_iids = []
+
         for p in paths:
-            if p not in self.files:
-                self.files.append(p)
-                self.listbox.insert("end", p)
+            if p in existing:
+                continue
+            iid = f"c{self._iid_counter}"
+            self._iid_counter += 1
+
+            base = os.path.basename(p)
+            self.items[iid] = {"path": p, "dur": None, "has_audio": None}
+            self.tree.insert("", "end", iid=iid, text=base, values=("…", "…"))
+            new_iids.append(iid)
+
+        # Default output path to the folder we selected clips from (first import batch)
+        if was_empty and len(self.items) > 0:
+            self._set_default_output_folder_from_path(paths[0])
+
+        if new_iids:
+            self._start_background_probe(new_iids)
+
+    def _start_background_probe(self, iids):
+        def worker():
+            for iid in iids:
+                item = self.items.get(iid)
+                if not item:
+                    continue
+                path = item["path"]
+                try:
+                    d = ffprobe_duration_seconds(path)
+                    a = ffprobe_has_audio(path)
+                except Exception:
+                    d = None
+                    a = None
+
+                def apply():
+                    cur = self.items.get(iid)
+                    if not cur:
+                        return
+                    cur["dur"] = d
+                    cur["has_audio"] = a
+                    self.tree.set(iid, "duration", fmt_time(d) if d is not None else "?")
+                    self.tree.set(iid, "audio", "yes" if a else "no" if a is not None else "?")
+
+                self.ui(apply)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def remove_selected(self):
-        sel = list(self.listbox.curselection())
+        sel = list(self.tree.selection())
         if not sel:
             return
-        for idx in reversed(sel):
-            self.files.pop(idx)
-            self.listbox.delete(idx)
+        self._preview_hide()
+        for iid in sel:
+            self.items.pop(iid, None)
+            self.tree.delete(iid)
 
     def clear_all(self):
-        self.files.clear()
-        self.listbox.delete(0, "end")
+        self._preview_hide()
+        self._drop_line_hide()
+        for iid in list(self.items.keys()):
+            self.tree.delete(iid)
+        self.items.clear()
 
     def move_selected(self, direction: int):
-        sel = list(self.listbox.curselection())
+        sel = list(self.tree.selection())
         if not sel:
             return
-        if sel != list(range(sel[0], sel[0] + len(sel))):
+
+        children = list(self.tree.get_children(""))
+        idxs = [children.index(i) for i in sel if i in children]
+        if not idxs:
+            return
+
+        idxs_sorted = sorted(idxs)
+        if idxs_sorted != list(range(idxs_sorted[0], idxs_sorted[0] + len(idxs_sorted))):
             messagebox.showinfo("Move", "Select a contiguous block to move.")
             return
 
-        start = sel[0]
-        end = sel[-1]
+        start = idxs_sorted[0]
+        end = idxs_sorted[-1]
         new_start = start + direction
         new_end = end + direction
-        if new_start < 0 or new_end >= len(self.files):
+        if new_start < 0 or new_end >= len(children):
             return
 
-        block = self.files[start:end + 1]
-        del self.files[start:end + 1]
-        for i, item in enumerate(block):
-            self.files.insert(new_start + i, item)
+        block = children[start:end + 1]
+        base = [c for c in children if c not in block]
+        base.insert(new_start, "__BLOCK__")
+        new_order = []
+        for c in base:
+            if c == "__BLOCK__":
+                new_order.extend(block)
+            else:
+                new_order.append(c)
 
-        self.listbox.delete(0, "end")
-        for f in self.files:
-            self.listbox.insert("end", f)
+        for idx, iid in enumerate(new_order):
+            self.tree.move(iid, "", idx)
 
-        self.listbox.selection_clear(0, "end")
-        for i in range(new_start, new_start + len(block)):
-            self.listbox.selection_set(i)
-        self.listbox.activate(new_start)
+        self.tree.selection_set(block)
+        self.tree.focus(block[0])
 
     def pick_output(self):
         path = filedialog.asksaveasfilename(
@@ -427,8 +832,31 @@ class App(tk.Tk):
         if path:
             self.out_var.set(path)
 
+    # ---------------- cancel ----------------
+    def cancel(self):
+        self.cancel_requested.set()
+        p = self.proc
+        if p and p.poll() is None:
+            try:
+                if p.stdin:
+                    p.stdin.write("q\n")
+                    p.stdin.flush()
+            except Exception:
+                pass
+        self.ui(self.set_status_text, "Cancelling…")
+
+    # ---------------- export ----------------
+    def _ordered_paths(self):
+        paths = []
+        for iid in self.tree.get_children(""):
+            item = self.items.get(iid)
+            if item:
+                paths.append(item["path"])
+        return paths
+
     def start(self):
-        if len(self.files) == 0:
+        paths = self._ordered_paths()
+        if len(paths) == 0:
             messagebox.showwarning("No clips", "Add at least one clip.")
             return
 
@@ -451,12 +879,18 @@ class App(tk.Tk):
         abitrate = int(self.abitrate_var.get())
         transition = self.transition_var.get()
 
-        # resolve selected codec label -> codec id
         idx = self.codec_menu.current()
-        vcodec = CODECS[idx][1] if idx >= 0 else self.codec_var.get()
+        vcodec = CODECS[idx][1] if idx >= 0 else "libx264"
 
-        self.start_btn.config(state="disabled")
-        self.set_status("Probing clips…")
+        self.cancel_requested.clear()
+        self.proc = None
+        self.total_out_seconds = 0.0
+        self.progress["value"] = 0
+
+        self._preview_hide()
+        self._drop_line_hide()
+        self.set_busy_state(True)
+        self.log.delete("1.0", "end")
         self.log_line("----")
         self.log_line("Starting…")
         self.log_line(f"Codec: {vcodec} | Quality(CRF/CQ): {quality} | Preset: {preset} | FPS: {fps}")
@@ -466,22 +900,34 @@ class App(tk.Tk):
                 durations = []
                 has_audio = []
 
-                for p in self.files:
-                    self.log_line(f"ffprobe: {p}")
-                    d = ffprobe_duration_seconds(p)
-                    a = ffprobe_has_audio(p)
+                self.ui(self.set_status_text, "Probing clips…")
+
+                for pth in paths:
+                    if self.cancel_requested.is_set():
+                        raise RuntimeError("Cancelled.")
+                    self.ui(self.log_line, f"ffprobe: {pth}")
+                    d = ffprobe_duration_seconds(pth)
+                    a = ffprobe_has_audio(pth)
                     durations.append(d)
                     has_audio.append(a)
-                    self.log_line(f"  duration: {d:.3f}s | audio: {'yes' if a else 'NO (silence will be added)'}")
+                    self.ui(self.log_line, f"  duration: {d:.3f}s | audio: {'yes' if a else 'NO (silence will be added)'}")
 
-                self.set_status("Building ffmpeg graph…")
+                n = len(durations)
+                out_total = sum(durations) - max(0, (n - 1)) * tdur
+                if out_total < 0:
+                    out_total = 0.0
+                self.total_out_seconds = out_total
+
+                self.ui(self.set_progress, 0.0, self.total_out_seconds, "")
+
+                self.ui(self.set_status_text, "Building ffmpeg graph…")
                 filt, vmap, amap = build_filter_graph(
-                    self.files, durations, has_audio, transition, tdur, fps=fps, width=1920, height=1080
+                    paths, durations, has_audio, transition, tdur, fps=fps, width=1920, height=1080
                 )
 
                 cmd = [FFMPEG, "-y"]
-                for p in self.files:
-                    cmd += ["-i", p]
+                for pth in paths:
+                    cmd += ["-i", pth]
 
                 cmd += [
                     "-filter_complex", filt,
@@ -491,44 +937,126 @@ class App(tk.Tk):
 
                 cmd += build_video_encode_args(vcodec, quality, preset)
 
-                # universal output flags
                 cmd += [
                     "-pix_fmt", "yuv420p",
                     "-movflags", "+faststart",
                     "-c:a", "aac",
                     "-b:a", f"{abitrate}k",
+                    "-progress", "pipe:1",
+                    "-nostats",
                     out_path
                 ]
 
                 pretty = " ".join(shlex.quote(x) for x in cmd)
-                self.log_line("")
-                self.log_line("FFmpeg command:")
-                self.log_line(pretty)
-                self.log_line("")
+                self.ui(self.log_line, "")
+                self.ui(self.log_line, "FFmpeg command:")
+                self.ui(self.log_line, pretty)
+                self.ui(self.log_line, "")
 
-                self.set_status("Encoding… (GPU goes brrr if NVENC)")
-                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                self.ui(self.set_status_text, "Encoding…")
+
+                p = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    stdin=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                    universal_newlines=True,
+                )
+                self.proc = p
+
+                def read_stderr():
+                    try:
+                        for line in p.stderr:
+                            if self.cancel_requested.is_set():
+                                break
+                            s = line.rstrip()
+                            if s:
+                                self.ui(self.log_line, s)
+                    except Exception:
+                        pass
+
+                t_err = threading.Thread(target=read_stderr, daemon=True)
+                t_err.start()
+
+                cur_sec = 0.0
+                speed = ""
+                last_ui = 0.0
 
                 for line in p.stdout:
-                    self.log_line(line.rstrip())
+                    if self.cancel_requested.is_set():
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip()
+
+                        if k == "out_time_ms":
+                            try:
+                                cur_sec = float(v) / 1_000_000.0
+                            except ValueError:
+                                pass
+                        elif k == "out_time":
+                            try:
+                                parts = v.split(":")
+                                if len(parts) == 3:
+                                    hh = int(parts[0])
+                                    mm = int(parts[1])
+                                    ss = float(parts[2])
+                                    cur_sec = hh * 3600 + mm * 60 + ss
+                            except Exception:
+                                pass
+                        elif k == "speed":
+                            speed = v
+
+                        now = time.time()
+                        if now - last_ui > 0.15:
+                            last_ui = now
+                            self.ui(self.set_progress, cur_sec, self.total_out_seconds, speed)
+                    else:
+                        self.ui(self.log_line, line)
+
+                if self.cancel_requested.is_set():
+                    try:
+                        if p.poll() is None:
+                            p.terminate()
+                            try:
+                                p.wait(timeout=2)
+                            except subprocess.TimeoutExpired:
+                                p.kill()
+                    except Exception:
+                        pass
+                    raise RuntimeError("Cancelled.")
 
                 code = p.wait()
                 if code != 0:
                     raise RuntimeError(f"ffmpeg failed with exit code {code}")
 
-                self.set_status("Done.")
-                self.log_line("")
-                self.log_line(f"SUCCESS: {out_path}")
-                messagebox.showinfo("Done", f"Export finished:\n{out_path}")
+                self.ui(self.set_progress, self.total_out_seconds, self.total_out_seconds, speed)
+                self.ui(self.set_status_text, "Done.")
+                self.ui(self.log_line, "")
+                self.ui(self.log_line, f"SUCCESS: {out_path}")
+                self.ui(messagebox.showinfo, "Done", f"Export finished:\n{out_path}")
 
             except Exception as e:
-                self.set_status("Error.")
-                self.log_line("")
-                self.log_line("ERROR:")
-                self.log_line(str(e))
-                messagebox.showerror("Error", str(e))
+                msg = str(e)
+                if "Cancelled" in msg:
+                    self.ui(self.set_status_text, "Cancelled.")
+                    self.ui(self.log_line, "")
+                    self.ui(self.log_line, "CANCELLED.")
+                else:
+                    self.ui(self.set_status_text, "Error.")
+                    self.ui(self.log_line, "")
+                    self.ui(self.log_line, "ERROR:")
+                    self.ui(self.log_line, msg)
+                    self.ui(messagebox.showerror, "Error", msg)
             finally:
-                self.start_btn.config(state="normal")
+                self.proc = None
+                self.ui(self.set_busy_state, False)
 
         threading.Thread(target=worker, daemon=True).start()
 
