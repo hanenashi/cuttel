@@ -9,17 +9,21 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 # ----------------------------
-# CUTTEL v1.5
-# Adds:
-# - Default output path set to folder of first imported clips (when list is empty)
-# - Drag & drop "drop line indicator" (visual insertion line)
-# Keeps:
-# - Hover preview thumbnails (popup on dwell)
-# - Cancel button
-# - Scrollable log
-# - Progress bar via -progress pipe:1
-# - x264/x265 + NVENC
+# CUTTEL v1.6  (full single-file)
+# - Remembers settings via cuttel.json (load on start, save on close + on Export)
+# - Default output location switches to clip folder on first import (if output not custom)
+# - Hover preview (popup after dwell) positioned near cursor (+20px), cached thumbnails
+# - Drag & drop reorder with a visible insertion line
+# - Cancel button (sends 'q', then terminates)
+# - Scrollable log + Clear log button
+# - Progress bar via FFmpeg: -progress pipe:1
 # ----------------------------
+
+DROP_LINE_COLOR = "#0b6b3a"  # dark green insertion line
+PREVIEW_DWELL_MS = 400
+PREVIEW_OFFSET_PX = 20
+PREVIEW_CLAMP_W = 360  # rough clamp size for keeping popup on-screen
+PREVIEW_CLAMP_H = 240
 
 XFADE_TRANSITIONS = [
     ("Fade", "fade"),
@@ -52,6 +56,9 @@ def which_or_hint(exe_name: str) -> str:
 
 FFMPEG = which_or_hint("ffmpeg")
 FFPROBE = which_or_hint("ffprobe")
+
+SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuttel.json")
+DEFAULT_OUT = os.path.join(os.path.expanduser("~"), "Desktop", "stitched_1080p.mp4")
 
 
 def run_cmd_capture(cmd_list):
@@ -155,7 +162,7 @@ def build_filter_graph(inputs, durations, has_audio, transition_name, tdur, fps=
             f"[{i}:v]"
             f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
-            f"fps={fps},scale=in_range=pc:out_range=tv,format=yuv420p,setsar=1"
+            f"fps={fps},format=yuv420p,setsar=1"
             f"[v{i}]"
         )
 
@@ -210,10 +217,9 @@ def fmt_time(sec: float) -> str:
 
 
 class App(tk.Tk):
-
     def __init__(self):
         super().__init__()
-        self.title("CUTTEL (FFmpeg) — v1.5")
+        self.title("CUTTEL (FFmpeg) — v1.6")
         self.geometry("1060x720")
         self.minsize(1060, 720)
 
@@ -240,13 +246,121 @@ class App(tk.Tk):
         # drag & drop state
         self._drag_iid = None
         self._drop_line_visible = False
-        self._drop_target = None  # (iid, insert_after_bool)
+
+        # settings
+        self._settings = self._load_settings()
 
         self._build_ui()
-        
-    def clear_log(self):
-        self.log.delete("1.0", "end")
+        self._apply_settings(self._settings)
 
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ---------------- settings ----------------
+    def _load_settings(self) -> dict:
+        try:
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except Exception:
+            return {}
+
+    def _collect_settings(self) -> dict:
+        def get_int(var, fallback):
+            try:
+                return int(var.get())
+            except Exception:
+                return fallback
+
+        def get_float(var, fallback):
+            try:
+                return float(var.get())
+            except Exception:
+                return fallback
+
+        try:
+            codec_index = int(self.codec_menu.current())
+        except Exception:
+            codec_index = 0
+
+        try:
+            outp = self.out_var.get().strip()
+        except Exception:
+            outp = ""
+
+        return {
+            "codec_index": codec_index,
+            "quality": get_int(self.quality_var, 28),
+            "preset": str(self.preset_var.get()),
+            "fps": get_int(self.fps_var, 30),
+            "abitrate": get_int(self.abitrate_var, 128),
+            "transition": str(self.transition_var.get()),
+            "tdur": get_float(self.tdur_var, 0.5),
+            "output_path": outp,
+        }
+
+    def _save_settings(self):
+        try:
+            with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._collect_settings(), f, indent=2)
+        except Exception:
+            pass  # no drama
+
+    def _apply_settings(self, s: dict):
+        # codec
+        ci = s.get("codec_index")
+        if isinstance(ci, int) and 0 <= ci < len(CODECS):
+            self.codec_menu.current(ci)
+
+        # quality/preset/fps/abitrate
+        if "quality" in s:
+            try:
+                self.quality_var.set(int(s["quality"]))
+            except Exception:
+                pass
+
+        if "preset" in s and s["preset"] in PRESETS:
+            self.preset_var.set(s["preset"])
+
+        if "fps" in s:
+            try:
+                self.fps_var.set(int(s["fps"]))
+            except Exception:
+                pass
+
+        if "abitrate" in s:
+            try:
+                self.abitrate_var.set(int(s["abitrate"]))
+            except Exception:
+                pass
+
+        # transition + tdur
+        tr = s.get("transition")
+        if isinstance(tr, str) and tr:
+            self.transition_var.set(tr)
+            for idx, (_name, code) in enumerate(XFADE_TRANSITIONS):
+                if code == tr:
+                    try:
+                        self.transition_menu.current(idx)
+                    except Exception:
+                        pass
+                    break
+
+        if "tdur" in s:
+            try:
+                self.tdur_var.set(str(float(s["tdur"])))
+            except Exception:
+                pass
+
+        # output path
+        op = s.get("output_path")
+        if isinstance(op, str) and op.strip():
+            self.out_var.set(op.strip())
+
+    def _on_close(self):
+        self._save_settings()
+        self.destroy()
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -278,8 +392,8 @@ class App(tk.Tk):
         self.tree_scroll.pack(side="right", fill="y")
         self.tree.configure(yscrollcommand=self.tree_scroll.set)
 
-        # Drop line indicator (a thin tk.Frame placed over the Treeview)
-        self.drop_line = tk.Frame(self.tree, height=3, bg="#0b6b3a")
+        # Drop line indicator
+        self.drop_line = tk.Frame(self.tree, height=3, bg=DROP_LINE_COLOR)
         self.drop_line.place_forget()
 
         # Hover preview bindings
@@ -333,7 +447,7 @@ class App(tk.Tk):
         self.codec_menu.grid(row=row, column=1, sticky="w", padx=8)
 
         ttk.Label(mid, text="Quality (CRF/CQ):").grid(row=row, column=2, sticky="w")
-        self.quality_var = tk.IntVar(value=28)  # sane HEVC-ish default
+        self.quality_var = tk.IntVar(value=28)
         ttk.Spinbox(mid, from_=16, to=35, textvariable=self.quality_var, width=6).grid(row=row, column=3, sticky="w")
 
         def on_codec_pick(_evt=None):
@@ -367,7 +481,7 @@ class App(tk.Tk):
             row=row, column=1, sticky="w", padx=8
         )
 
-        ttk.Label(mid, text="Hover preview + drag & drop reorder (with insertion line).").grid(
+        ttk.Label(mid, text="Hover preview (dwell) + drag & drop reorder (insertion line).").grid(
             row=row, column=2, columnspan=2, sticky="w"
         )
 
@@ -377,7 +491,7 @@ class App(tk.Tk):
         out = ttk.LabelFrame(root, text="Output", padding=10)
         out.pack(fill="x", pady=(10, 0))
 
-        self.out_var = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "Desktop", "stitched_1080p.mp4"))
+        self.out_var = tk.StringVar(value=DEFAULT_OUT)
         self.out_entry = ttk.Entry(out, textvariable=self.out_var)
         self.out_entry.pack(side="left", fill="x", expand=True)
         ttk.Button(out, text="Browse…", command=self.pick_output).pack(side="left", padx=(8, 0))
@@ -421,7 +535,10 @@ class App(tk.Tk):
         except tk.TclError:
             pass
 
-    # ---------------- general helpers ----------------
+    # ---------------- log helpers ----------------
+    def clear_log(self):
+        self.log.delete("1.0", "end")
+
     def _on_mousewheel(self, event):
         lines = int(-1 * (event.delta / 120))
         self.log.yview_scroll(lines, "units")
@@ -475,7 +592,7 @@ class App(tk.Tk):
             "-f", "image2",
             out_png
         ]
-        code, out, err = run_cmd_capture(cmd)
+        code, _out, _err = run_cmd_capture(cmd)
         if code != 0 or not os.path.exists(out_png):
             return None
         return out_png
@@ -534,6 +651,19 @@ class App(tk.Tk):
             self.ui(self._preview_update_image, iid, photo)
         threading.Thread(target=worker, daemon=True).start()
 
+    def _clamp_preview_pos(self, x_root: int, y_root: int) -> tuple[int, int]:
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        if x_root + PREVIEW_CLAMP_W > sw:
+            x_root = sw - PREVIEW_CLAMP_W - 10
+        if y_root + PREVIEW_CLAMP_H > sh:
+            y_root = sh - PREVIEW_CLAMP_H - 10
+        if x_root < 10:
+            x_root = 10
+        if y_root < 10:
+            y_root = 10
+        return int(x_root), int(y_root)
+
     def _on_tree_motion(self, event):
         if self._drag_iid is not None:
             self._preview_hide()
@@ -549,22 +679,10 @@ class App(tk.Tk):
 
         self._preview_hide()
 
-        # Place preview near cursor (20px offset), clamp to screen edges
-        x_root = self.winfo_pointerx() + 20
-        y_root = self.winfo_pointery() + 20
-
-        sw = self.winfo_screenwidth()
-        sh = self.winfo_screenheight()
-        # Approx preview size (safe-ish); tweak if you want bigger
-        pw, ph = 360, 240
-        if x_root + pw > sw:
-            x_root = sw - pw - 10
-        if y_root + ph > sh:
-            y_root = sh - ph - 10
-        if x_root < 10:
-            x_root = 10
-        if y_root < 10:
-            y_root = 10
+        # popup near cursor (+20px)
+        x_root = self.winfo_pointerx() + PREVIEW_OFFSET_PX
+        y_root = self.winfo_pointery() + PREVIEW_OFFSET_PX
+        x_root, y_root = self._clamp_preview_pos(x_root, y_root)
 
         self._hover_iid = iid
 
@@ -577,51 +695,45 @@ class App(tk.Tk):
             self._preview_show_loading(iid, x_root, y_root)
             self._preview_load_async(iid, item["path"])
 
-        self._hover_after_id = self.after(400, show)
+        self._hover_after_id = self.after(PREVIEW_DWELL_MS, show)
 
-    def _on_tree_leave(self, event):
+    def _on_tree_leave(self, _event):
         self._preview_hide()
         self._drop_line_hide()
 
     # ---------------- drop line indicator ----------------
     def _drop_line_show(self, y: int):
-        # Place inside the Treeview widget (not frame), so it scrolls naturally
         w = max(10, self.tree.winfo_width())
-        self.drop_line.place(in_=self.tree, x=0, y=y, width=w, height=2)
+        self.drop_line.place(in_=self.tree, x=0, y=y, width=w, height=3)
         self._drop_line_visible = True
 
     def _drop_line_hide(self):
         if self._drop_line_visible:
             self.drop_line.place_forget()
             self._drop_line_visible = False
-        self._drop_target = None
 
-    def _compute_drop_target(self, event_y: int):
+    def _compute_drop_line_y(self, event_y: int):
         iid = self.tree.identify_row(event_y)
         if not iid:
             return None
-
         bbox = self.tree.bbox(iid)
         if not bbox:
             return None
-
-        x, y, w, h = bbox
+        _x, y, _w, h = bbox
         insert_after = event_y > (y + h / 2)
         line_y = y + (h if insert_after else 0)
-        return (iid, insert_after, line_y)
+        return iid, insert_after, int(line_y)
 
     # ---------------- drag & drop reorder ----------------
     def _on_tree_press(self, event):
         region = self.tree.identify_region(event.x, event.y)
         if region == "heading":
             return
-
         iid = self.tree.identify_row(event.y)
         if not iid:
             self._drag_iid = None
             self._drop_line_hide()
             return
-
         self._drag_iid = iid
         self._preview_hide()
 
@@ -636,17 +748,13 @@ class App(tk.Tk):
     def _on_tree_drag(self, event):
         if not self._drag_iid:
             return
-
         self._preview_hide()
-
-        tgt = self._compute_drop_target(event.y)
+        tgt = self._compute_drop_line_y(event.y)
         if not tgt:
             self._drop_line_hide()
             return
-
-        iid, insert_after, line_y = tgt
-        self._drop_target = (iid, insert_after)
-        self._drop_line_show(int(line_y))
+        _iid, _insert_after, line_y = tgt
+        self._drop_line_show(line_y)
 
     def _on_tree_release(self, event):
         if not self._drag_iid:
@@ -675,7 +783,7 @@ class App(tk.Tk):
         bbox = self.tree.bbox(drop_iid)
         insert_after = False
         if bbox:
-            x, y, w, h = bbox
+            _x, y, _w, h = bbox
             if event.y > y + (h / 2):
                 insert_after = True
 
@@ -696,12 +804,24 @@ class App(tk.Tk):
 
         self.tree.selection_set(block)
         self.tree.focus(block[0])
-
         self._drag_iid = None
 
     # ---------------- list operations ----------------
     def _existing_paths_set(self):
         return {item["path"] for item in self.items.values()}
+
+    def _should_autoset_output_on_first_import(self) -> bool:
+        # Only auto-set output path if user didn't already choose something custom.
+        current = (self.out_var.get() or "").strip()
+        saved = (self._settings.get("output_path") or "").strip()
+        if saved:
+            # they had something saved -> don't override
+            return False
+        if not current:
+            return True
+        if os.path.normpath(current) == os.path.normpath(DEFAULT_OUT):
+            return True
+        return False
 
     def _set_default_output_folder_from_path(self, first_path: str):
         folder = os.path.dirname(first_path)
@@ -736,8 +856,9 @@ class App(tk.Tk):
             new_iids.append(iid)
 
         # Default output path to the folder we selected clips from (first import batch)
-        if was_empty and len(self.items) > 0:
+        if was_empty and len(self.items) > 0 and self._should_autoset_output_on_first_import():
             self._set_default_output_folder_from_path(paths[0])
+            self._save_settings()  # persist the new default immediately
 
         if new_iids:
             self._start_background_probe(new_iids)
@@ -831,6 +952,7 @@ class App(tk.Tk):
         )
         if path:
             self.out_var.set(path)
+            self._save_settings()
 
     # ---------------- cancel ----------------
     def cancel(self):
@@ -872,6 +994,9 @@ class App(tk.Tk):
         except ValueError:
             messagebox.showwarning("Bad transition duration", "Transition duration must be a number between 0 and 5.")
             return
+
+        # Save settings immediately (so your choices survive even if FFmpeg dies)
+        self._save_settings()
 
         fps = int(self.fps_var.get())
         quality = int(self.quality_var.get())
@@ -1062,5 +1187,4 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    App().mainloop()

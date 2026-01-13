@@ -1,0 +1,10 @@
+{
+  "codec_index": 3,
+  "quality": 28,
+  "preset": "slow",
+  "fps": 30,
+  "abitrate": 128,
+  "transition": "fade",
+  "tdur": 0.5,
+  "output_path": "C:\\Users\\hanenashi\\Desktop\\stitched_1080p.mp4"
+}
